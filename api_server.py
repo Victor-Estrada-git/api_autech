@@ -7,14 +7,25 @@ from pda_logic import PDA, PDASimulator, convert_pda_to_cfg
 from regex_logic import (
     regex_to_min_dfa_json,
     automaton_to_regex,
-    operation_union,
-    operation_intersection,
-    operation_kleene,
     parse_regex,
     build_nfa,
-    nfa_to_dfa,
+    nfa_to_dfa as rl_nfa_to_dfa,   # regex_logic version (para otros endpoints)
     minimize_dfa,
     automaton_to_json,
+)
+from lenguajes_regulares import (
+    NFA  as LR_NFA,
+    DFA  as LR_DFA,
+    nfa_to_dfa as lr_nfa_to_dfa,   # lenguajes_regulares version
+    op_union,
+    op_concat,
+    op_kleene,
+    op_complement,
+    op_intersection,
+    op_difference,
+    op_reverse,
+    op_homomorphism,
+    op_right_quotient,
 )
 from turing_logic import simulate_turing, parse_transitions, build_graph_json
 
@@ -177,60 +188,110 @@ class LanguageOperationRequest(BaseModel):
     regex2: Optional[str] = None   # only for binary ops
 
 
+
+# ─── Helpers: lenguajes_regulares ↔ automaton_to_json ─────────────────────────
+
+def _build_lr_dfa(regex: str) -> LR_DFA:
+    """
+    Construye un LR_DFA desde una regex usando el parser de regex_logic
+    y lo envuelve en la clase DFA de lenguajes_regulares.
+    """
+    tokens = parse_regex(regex)
+    nfa_s, nfa_t, nfa_i, nfa_f = build_nfa(tokens)
+    dfa_s, dfa_t, dfa_i, dfa_a, alpha = rl_nfa_to_dfa(nfa_s, nfa_t, nfa_i, nfa_f)
+    min_s, min_t, min_i, min_a = minimize_dfa(dfa_s, dfa_t, dfa_i, dfa_a, alpha)
+    return LR_DFA(set(min_s), alpha, min_t, min_i, set(min_a))
+
+
+def _lr_to_json(automaton) -> dict:
+    """
+    Convierte un NFA o DFA de lenguajes_regulares al formato de automaton_to_json.
+    Los estados pueden ser objetos State (con .name) o strings.
+    """
+    if isinstance(automaton, LR_NFA):
+        automaton = lr_nfa_to_dfa(automaton)
+
+    def sname(s):
+        return s.name if hasattr(s, "name") else str(s)
+
+    states      = [sname(s) for s in automaton.states]
+    initial     = sname(automaton.start)
+    accepting   = {sname(s) for s in automaton.accept}
+    alphabet    = sorted(automaton.alphabet)
+    transitions = {
+        sname(s): {sym: sname(tgt) for sym, tgt in t.items()}
+        for s, t in automaton.transitions.items()
+    }
+    return automaton_to_json(states, transitions, initial, accepting, alphabet)
+
+
 @app.post("/regex/operation")
 async def regex_operation(data: LanguageOperationRequest):
     """
-    Aplica una operación de lenguaje sobre uno o dos AFDs generados desde regex.
-    Operaciones soportadas: union, intersection, kleene, complement.
+    Aplica una operación de lenguaje sobre uno o dos DFAs construidos desde regex.
+
+    Todas las operaciones se resuelven en el servidor usando lenguajes_regulares.py:
+      Unarias  : kleene | complement | reverse
+      Binarias : union | intersection | difference | concat
+      Con param: homomorphism (mapping: dict) | rightquotient (symbol: str)
+
     Respuesta: { "states": [...], "edges": [...], "alphabet": [...] }
     """
     try:
         if not data.regex1:
             raise ValueError("Se requiere al menos regex1.")
 
-        # Build first automaton
-        tokens1 = parse_regex(data.regex1)
-        nfa_s1, nfa_t1, nfa_i1, nfa_f1 = build_nfa(tokens1)
-        dfa_s1, dfa_t1, dfa_i1, dfa_a1, alpha1 = nfa_to_dfa(nfa_s1, nfa_t1, nfa_i1, nfa_f1)
-        s1, t1, i1, a1 = minimize_dfa(dfa_s1, dfa_t1, dfa_i1, dfa_a1, alpha1)
+        op   = data.operation.lower()
+        dfa1 = _build_lr_dfa(data.regex1)
 
-        op = data.operation.lower()
-
+        # ── Operaciones unarias ────────────────────────────────────────────────
         if op == "kleene":
-            result = operation_kleene(s1, t1, i1, a1, alpha1)
+            result = op_kleene(dfa1)
 
         elif op == "complement":
-            # Complement: flip accepting and non-accepting states
-            all_states = set(s1)
-            new_accepting = all_states - set(a1)
-            result = automaton_to_json(s1, t1, i1, new_accepting, alpha1)
+            result = op_complement(dfa1)
 
-        elif op in ("union", "intersection"):
+        elif op == "reverse":
+            result = op_reverse(dfa1)
+
+        elif op == "homomorphism":
+            if not data.mapping:
+                raise ValueError("Se requiere el campo 'mapping' para homomorfismo.")
+            result = op_homomorphism(dfa1, data.mapping)
+
+        elif op == "rightquotient":
+            if not data.symbol:
+                raise ValueError("Se requiere el campo 'symbol' para cociente derecho.")
+            result = op_right_quotient(dfa1, data.symbol)
+
+        # ── Operaciones binarias ───────────────────────────────────────────────
+        elif op in ("union", "intersection", "difference", "concat"):
             if not data.regex2:
-                raise ValueError(f"La operación '{op}' requiere regex2.")
-
-            tokens2 = parse_regex(data.regex2)
-            nfa_s2, nfa_t2, nfa_i2, nfa_f2 = build_nfa(tokens2)
-            # Unify alphabets
-            alpha = alpha1
-            dfa_s2, dfa_t2, dfa_i2, dfa_a2, alpha2 = nfa_to_dfa(nfa_s2, nfa_t2, nfa_i2, nfa_f2)
-            alpha = alpha1 | alpha2
-            s2, t2, i2, a2 = minimize_dfa(dfa_s2, dfa_t2, dfa_i2, dfa_a2, alpha)
+                raise ValueError(f"La operacion '{op}' requiere regex2.")
+            dfa2 = _build_lr_dfa(data.regex2)
 
             if op == "union":
-                result = operation_union(s1, t1, i1, a1, s2, t2, i2, a2, alpha)
-            else:
-                result = operation_intersection(s1, t1, i1, a1, s2, t2, i2, a2, alpha)
-        else:
-            raise ValueError(f"Operación desconocida: '{op}'. Use: union, intersection, kleene, complement.")
+                result = op_union(dfa1, dfa2)
+            elif op == "intersection":
+                result = op_intersection(dfa1, dfa2)
+            elif op == "difference":
+                result = op_difference(dfa1, dfa2)
+            else:  # concat
+                result = op_concat(dfa1, dfa2)
 
-        return result
+        else:
+            raise ValueError(
+                f"Operacion desconocida: '{op}'. "
+                "Soportadas: union, intersection, kleene, complement, "
+                "difference, concat, reverse, homomorphism, rightquotient."
+            )
+
+        return _lr_to_json(result)
 
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
-
 
 # ─── Turing ───────────────────────────────────────────────────────────────────
 
@@ -303,7 +364,7 @@ async def root():
             "POST /pda/to-cfg",
             "GET  /regex/to-automaton?exp=<regex>",
             "POST /regex/automaton-to-regex",
-            "POST /regex/operation",
+            "POST /regex/operation  (union|intersection|kleene|complement|difference|concat|reverse|homomorphism|rightquotient)",
             "POST /turing/simulate",
             "POST /turing/graph",
         ],
