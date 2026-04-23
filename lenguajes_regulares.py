@@ -2,12 +2,14 @@
 ╔══════════════════════════════════════════════════════════════╗
 ║       Operaciones sobre Lenguajes Regulares                  ║
 ║  Construcción de Thompson + Algoritmo de Subconjuntos        ║
+║  + Minimización de AFD (llenado de tabla / Hopcroft)         ║
 ╚══════════════════════════════════════════════════════════════╝
 
 Operaciones implementadas:
-  DEFINICIÓN   : Unión, Concatenación, Cierre de Kleene (L*)
-  CERRADURA    : Intersección, Complemento, Diferencia
+  DEFINICIÓN    : Unión, Concatenación, Cierre de Kleene (L*)
+  CERRADURA     : Intersección, Complemento, Diferencia
   TRANSFORMACIÓN: Reversa, Homomorfismo, Cociente por la derecha
+  MINIMIZACIÓN  : minimize_dfa  (tabla de distinguibilidad + Union-Find)
 """
 
 from collections import deque
@@ -16,7 +18,7 @@ from collections import deque
 # CONSTANTES
 # ══════════════════════════════════════════════════════════════
 
-EPSILON = 'ε'  # símbolo épsilon
+EPSILON = 'ε'
 
 
 # ══════════════════════════════════════════════════════════════
@@ -58,10 +60,7 @@ class NFA:
         self.start       = start
         self.accept      = set(accept)
 
-    # ── Operaciones sobre conjuntos de estados ──────────────────
-
     def epsilon_closure(self, states):
-        """Clausura-ε de un conjunto de estados."""
         closure = set(states)
         stack   = list(states)
         while stack:
@@ -73,28 +72,24 @@ class NFA:
         return frozenset(closure)
 
     def move(self, states, symbol):
-        """Estados alcanzables leyendo 'symbol' desde 'states'."""
         result = set()
         for s in states:
             result |= self.transitions.get(s, {}).get(symbol, set())
         return result
 
     def accepts(self, string):
-        """Devuelve True si el AFN acepta 'string'."""
         current = self.epsilon_closure({self.start})
         for c in string:
             current = self.epsilon_closure(self.move(current, c))
         return bool(current & self.accept)
 
-    # ── Visualización ───────────────────────────────────────────
-
     def print_automaton(self, title="AFN-ε"):
         print(f"\n{'═'*56}")
         print(f"  {title}")
         print(f"{'═'*56}")
-        print(f"  Estados          : {sorted(self.states)}")
-        print(f"  Alfabeto         : {sorted(self.alphabet)}")
-        print(f"  Estado inicial   : {self.start}")
+        print(f"  Estados           : {sorted(self.states)}")
+        print(f"  Alfabeto          : {sorted(self.alphabet)}")
+        print(f"  Estado inicial    : {self.start}")
         print(f"  Estados aceptación: {sorted(self.accept)}")
         print(f"  Transiciones:")
         for state in sorted(self.states):
@@ -118,7 +113,6 @@ class DFA:
         self.accept      = set(accept)
 
     def accepts(self, string):
-        """Devuelve True si el AFD acepta 'string'."""
         current = self.start
         for c in string:
             current = self.transitions.get(current, {}).get(c)
@@ -129,8 +123,8 @@ class DFA:
     def complete(self):
         """Devuelve un AFD completo agregando estado muerto si es necesario."""
         DEAD = "∅"
-        new_trans   = {s: dict(t) for s, t in self.transitions.items()}
-        needs_dead  = False
+        new_trans  = {s: dict(t) for s, t in self.transitions.items()}
+        needs_dead = False
         for state in list(self.states):
             for sym in self.alphabet:
                 if sym not in new_trans.get(state, {}):
@@ -138,16 +132,17 @@ class DFA:
                     needs_dead = True
         if needs_dead:
             new_trans[DEAD] = {sym: DEAD for sym in self.alphabet}
-            return DFA(self.states | {DEAD}, self.alphabet, new_trans, self.start, self.accept)
+            return DFA(self.states | {DEAD}, self.alphabet, new_trans,
+                       self.start, self.accept)
         return DFA(self.states, self.alphabet, new_trans, self.start, self.accept)
 
     def print_automaton(self, title="AFD"):
         print(f"\n{'═'*56}")
         print(f"  {title}")
         print(f"{'═'*56}")
-        print(f"  Estados          : {sorted(str(s) for s in self.states)}")
-        print(f"  Alfabeto         : {sorted(self.alphabet)}")
-        print(f"  Estado inicial   : {self.start}")
+        print(f"  Estados           : {sorted(str(s) for s in self.states)}")
+        print(f"  Alfabeto          : {sorted(self.alphabet)}")
+        print(f"  Estado inicial    : {self.start}")
         print(f"  Estados aceptación: {sorted(str(s) for s in self.accept)}")
         print(f"  Transiciones:")
         for state in sorted(str(s) for s in self.states):
@@ -163,7 +158,6 @@ class DFA:
 # ══════════════════════════════════════════════════════════════
 
 def _basic(symbol):
-    """AFN-ε para un símbolo (o ε)."""
     s0, s1 = _new_state(), _new_state()
     trans  = {s0: {symbol: {s1}}}
     alpha  = set() if symbol == EPSILON else {symbol}
@@ -171,7 +165,6 @@ def _basic(symbol):
 
 
 def thompson_union(n1, n2):
-    """Thompson: AFN-ε para L1 ∪ L2."""
     s0, sf = _new_state(), _new_state()
     trans  = {}
     for s, t in n1.transitions.items():
@@ -186,7 +179,6 @@ def thompson_union(n1, n2):
 
 
 def thompson_concat(n1, n2):
-    """Thompson: AFN-ε para L1 · L2."""
     trans = {}
     for s, t in n1.transitions.items():
         trans[s] = {sym: set(sts) for sym, sts in t.items()}
@@ -199,7 +191,6 @@ def thompson_concat(n1, n2):
 
 
 def thompson_star(n):
-    """Thompson: AFN-ε para L*  (Cierre de Kleene)."""
     s0, sf = _new_state(), _new_state()
     trans  = {}
     for s, t in n.transitions.items():
@@ -211,12 +202,10 @@ def thompson_star(n):
 
 
 def thompson_plus(n):
-    """Thompson: AFN-ε para L+  (una o más repeticiones)."""
     return thompson_concat(n, thompson_star(n))
 
 
 def thompson_optional(n):
-    """Thompson: AFN-ε para L?  (cero o una vez)."""
     return thompson_union(n, _basic(EPSILON))
 
 
@@ -300,17 +289,7 @@ class _RegexParser:
 
 
 def regex_to_nfa(regex, reset_counter=False):
-    """
-    Convierte una expresión regular a un AFN-ε usando la Construcción de Thompson.
-
-    Ejemplos de regex válidas:
-      (a|b)*       → cadenas sobre {a,b}
-      ab*c         → 'a' seguido de 0+ 'b' y una 'c'
-      (0|1)+       → cadenas binarias no vacías
-      a?(b|c)*     → opcional 'a' seguido de b/c repetidos
-
-    reset_counter: pone a 0 el contador de estados (útil solo para demostraciones aisladas).
-    """
+    """Convierte una expresión regular a un AFN-ε (Construcción de Thompson)."""
     if reset_counter:
         State._counter = 0
     return _RegexParser(regex).parse()
@@ -322,12 +301,10 @@ def regex_to_nfa(regex, reset_counter=False):
 
 def nfa_to_dfa(nfa):
     """
-    Convierte un AFN-ε en un AFD mediante el Algoritmo de Construcción de Subconjuntos.
-
-    Cada estado del AFD representa un subconjunto de estados del AFN.
+    Convierte un AFN-ε en un AFD (Algoritmo de Construcción de Subconjuntos).
     """
     ctr       = [0]
-    state_map = {}              # frozenset(NFA states) → nombre DFA
+    state_map = {}
 
     def dfa_name(fs):
         if fs not in state_map:
@@ -362,7 +339,154 @@ def nfa_to_dfa(nfa):
 
 
 # ══════════════════════════════════════════════════════════════
-# CONVERSIÓN DFA → NFA  (trivial, para reutilizar operaciones)
+# MINIMIZACIÓN DE AFD  (llenado de tabla + Union-Find)
+# ══════════════════════════════════════════════════════════════
+
+def minimize_dfa(dfa):
+    """
+    Minimiza un AFD usando el algoritmo de llenado de tabla
+    (equivalente a Myhill-Nerode / Hopcroft simplificado).
+
+    Pasos:
+      1. Completar el AFD (agregar estado muerto si falta).
+      2. Eliminar estados inalcanzables.
+      3. Marcar pares distinguibles:
+         - Base : (aceptación, no-aceptación)
+         - Iteración : δ(p,a) y δ(q,a) ya marcados → marcar (p,q)
+      4. Unir estados indistinguibles (Union-Find).
+      5. Construir el AFD mínimo.
+      6. Eliminar estado muerto resultante (si existe).
+
+    Devuelve un DFA minimizado.
+    """
+    if not dfa.states:
+        return dfa
+
+    # ── 1. Completar ─────────────────────────────────────────
+    d = dfa.complete()
+
+    # ── 2. Estados alcanzables ────────────────────────────────
+    reachable = {d.start}
+    stack     = [d.start]
+    while stack:
+        s = stack.pop()
+        for sym in d.alphabet:
+            t = d.transitions.get(s, {}).get(sym)
+            if t and t not in reachable:
+                reachable.add(t)
+                stack.append(t)
+
+    states = sorted(str(s) for s in reachable)
+    n      = len(states)
+    if n == 0:
+        return dfa
+
+    idx = {s: i for i, s in enumerate(states)}
+
+    # ── 3. Tabla de distinguibilidad ─────────────────────────
+    # marked[i][j] = True  ⟺  states[i] y states[j] distinguibles (i < j)
+    marked = [[False] * n for _ in range(n)]
+
+    for i in range(n):
+        for j in range(i + 1, n):
+            if (states[i] in d.accept) != (states[j] in d.accept):
+                marked[i][j] = True
+
+    changed = True
+    while changed:
+        changed = False
+        for i in range(n):
+            for j in range(i + 1, n):
+                if marked[i][j]:
+                    continue
+                for sym in d.alphabet:
+                    ti = d.transitions.get(states[i], {}).get(sym)
+                    tj = d.transitions.get(states[j], {}).get(sym)
+                    if ti is None or tj is None:
+                        continue
+                    ti, tj = str(ti), str(tj)
+                    ii = idx.get(ti, -1)
+                    jj = idx.get(tj, -1)
+                    if ii < 0 or jj < 0 or ii == jj:
+                        continue
+                    p, q = (ii, jj) if ii < jj else (jj, ii)
+                    if marked[p][q]:
+                        marked[i][j] = True
+                        changed = True
+                        break
+
+    # ── 4. Union-Find ─────────────────────────────────────────
+    parent = list(range(n))
+
+    def find(x):
+        while parent[x] != x:
+            parent[x] = parent[parent[x]]
+            x = parent[x]
+        return x
+
+    def union(a, b):
+        ra, rb = find(a), find(b)
+        if ra != rb:
+            parent[ra] = rb
+
+    for i in range(n):
+        for j in range(i + 1, n):
+            if not marked[i][j]:
+                union(i, j)
+
+    # ── 5. Construir grupos ───────────────────────────────────
+    groups: dict[int, list[str]] = {}
+    for i in range(n):
+        root = find(i)
+        groups.setdefault(root, []).append(states[i])
+
+    group_name = {root: f"M{gi}" for gi, root in enumerate(sorted(groups))}
+    state_to_group = {s: group_name[find(idx[s])] for s in states}
+
+    min_trans: dict[str, dict[str, str]] = {}
+    min_accept: set[str] = set()
+
+    for root, members in groups.items():
+        gname = group_name[root]
+        rep   = members[0]
+        min_trans[gname] = {}
+        for sym in d.alphabet:
+            t = d.transitions.get(rep, {}).get(sym)
+            if t is not None:
+                tg = state_to_group.get(str(t))
+                if tg:
+                    min_trans[gname][sym] = tg
+        if rep in d.accept:
+            min_accept.add(gname)
+
+    min_start  = state_to_group[str(d.start)]
+    min_states = set(group_name.values())
+
+    # ── 6. Eliminar estado muerto ─────────────────────────────
+    dead_states = {
+        s for s in min_states
+        if s not in min_accept
+        and all(min_trans.get(s, {}).get(sym) == s for sym in d.alphabet)
+    }
+
+    final_states = min_states - dead_states
+    final_trans  = {
+        s: {sym: t for sym, t in (min_trans.get(s) or {}).items()
+            if t not in dead_states}
+        for s in final_states
+    }
+
+    return DFA(
+        final_states,
+        d.alphabet,
+        final_trans,
+        min_start,
+        min_accept - dead_states,
+    )
+
+
+# ══════════════════════════════════════════════════════════════
+# CONVERSIÓN DFA → NFA  (trivial)
 # ══════════════════════════════════════════════════════════════
 
 def dfa_to_nfa(dfa):
@@ -376,7 +500,6 @@ def dfa_to_nfa(dfa):
 # ══════════════════════════════════════════════════════════════
 
 # ── 1. OPERACIONES DE DEFINICIÓN ──────────────────────────────
-# (Thompson ya implementa unión, concatenación y Kleene sobre NFAs)
 
 def op_union(a1, a2):
     """L1 ∪ L2 — todas las cadenas en L1 o en L2."""
@@ -399,22 +522,14 @@ def op_kleene(a):
 # ── 2. PROPIEDADES DE CERRADURA ───────────────────────────────
 
 def op_intersection(a1, a2):
-    """
-    L1 ∩ L2 — Producto cartesiano de estados.
-
-    Se obtiene un AFD cuyos estados son pares (q1, q2) del producto cartesiano.
-    Un par es de aceptación solo si AMBOS componentes lo son.
-    """
+    """L1 ∩ L2 — Producto cartesiano de estados."""
     d1 = (a1 if isinstance(a1, DFA) else nfa_to_dfa(a1)).complete()
     d2 = (a2 if isinstance(a2, DFA) else nfa_to_dfa(a2)).complete()
     alpha = d1.alphabet | d2.alphabet
-
     start = (d1.start, d2.start)
     queue = deque([start]); visited = set()
     trans = {}; acc = set()
-
     name = lambda p: f"({p[0]},{p[1]})"
-
     while queue:
         (s1, s2) = queue.popleft()
         if (s1, s2) in visited: continue
@@ -428,37 +543,24 @@ def op_intersection(a1, a2):
             trans.setdefault(name((s1, s2)), {})[sym] = name(nxt)
             if nxt not in visited:
                 queue.append(nxt)
-
     return DFA({name(p) for p in visited}, alpha, trans, name(start), acc)
 
 
 def op_complement(a):
-    """
-    L̄  — Complemento: todas las cadenas sobre Σ que NO están en L.
-
-    Se intercambian los estados finales por no finales en el AFD completo.
-    """
+    """L̄ — Complemento: cadenas sobre Σ que NO están en L."""
     d = (a if isinstance(a, DFA) else nfa_to_dfa(a)).complete()
     return DFA(d.states, d.alphabet, d.transitions, d.start, d.states - d.accept)
 
 
 def op_difference(a1, a2):
-    """
-    L1 − L2 = L1 ∩ L̄2  — cadenas en L1 pero no en L2.
-    """
+    """L1 − L2 = L1 ∩ L̄2"""
     return op_intersection(a1, op_complement(a2))
 
 
 # ── 3. OPERACIONES DE TRANSFORMACIÓN ─────────────────────────
 
 def op_reverse(a):
-    """
-    L^R — Reversa: todas las cadenas de L escritas al revés.
-
-    Se invierten las transiciones, el antiguo estado inicial se vuelve
-    el nuevo estado de aceptación, y los antiguos estados de aceptación
-    se conectan vía ε a un nuevo estado inicial.
-    """
+    """L^R — Reversa: cadenas de L escritas al revés."""
     dfa  = a if isinstance(a, DFA) else nfa_to_dfa(a)
     rev  = {}
     for state, t in dfa.transitions.items():
@@ -472,20 +574,18 @@ def op_reverse(a):
 
 def op_homomorphism(a, h):
     """
-    Homomorfismo: sustituye cada símbolo del alfabeto por una cadena de otro.
-
+    Homomorfismo: sustituye cada símbolo del alfabeto por una cadena.
     h : dict  { 'a' -> 'xy', 'b' -> 'z', ... }
     """
     dfa = a if isinstance(a, DFA) else nfa_to_dfa(a)
-    so  = {s: State(f"h_{s}") for s in dfa.states}     # renombrado
+    so  = {s: State(f"h_{s}") for s in dfa.states}
     all_s = set(so.values())
     trans = {}
-
     for state, t in dfa.transitions.items():
         for sym, tgt in t.items():
             img = h.get(sym, sym)
             src, dst = so[state], so[tgt]
-            if not img:                                  # h(a) = ε
+            if not img:
                 trans.setdefault(src, {}).setdefault(EPSILON, set()).add(dst)
             else:
                 prev = src
@@ -494,7 +594,6 @@ def op_homomorphism(a, h):
                     if i != len(img) - 1: all_s.add(nxt)
                     trans.setdefault(prev, {}).setdefault(c, set()).add(nxt)
                     prev = nxt
-
     new_alpha = {c for v in h.values() for c in v}
     nfa = NFA(all_s, new_alpha, trans, so[dfa.start], {so[s] for s in dfa.accept})
     return nfa_to_dfa(nfa)
@@ -503,11 +602,7 @@ def op_homomorphism(a, h):
 def op_right_quotient(a, symbol):
     """
     L/a — Cociente por la derecha con símbolo 'a'.
-
     L/a = { w | wa ∈ L }
-
-    Los nuevos estados de aceptación son aquellos desde los que leer
-    'symbol' lleva a un estado de aceptación del AFD original.
     """
     dfa = a if isinstance(a, DFA) else nfa_to_dfa(a)
     new_acc = {
@@ -551,8 +646,7 @@ def input_nfa_manual():
         src_s, sym, dsts_s = parts[0].strip(), parts[1].strip(), parts[2].strip()
         sym = EPSILON if sym in ('@', 'epsilon', 'eps', 'ε') else sym
         dst_list = [d.strip() for d in dsts_s.split(';')]
-
-        src_obj = state_objs.get(src_s)
+        src_obj  = state_objs.get(src_s)
         if not src_obj:
             print(f"  [!] Estado '{src_s}' no reconocido."); continue
         dst_objs = set()
@@ -578,6 +672,7 @@ BANNER = """
 ╔══════════════════════════════════════════════════════════════╗
 ║       Operaciones sobre Lenguajes Regulares                  ║
 ║  Construcción de Thompson  +  Algoritmo de Subconjuntos      ║
+║  +  Minimización de AFD                                      ║
 ╚══════════════════════════════════════════════════════════════╝
 """
 
@@ -602,9 +697,12 @@ MENU = """
   [11] Homomorfismo
   [12] Cociente der.  L / a
 
+  ── Minimización ────────────────────────────────────────────
+  [13] Minimizar AFD  (tabla de distinguibilidad)
+
   ── Utilidades ─────────────────────────────────────────────
-  [13] Probar cadena en un autómata
-  [14] Mostrar autómata guardado
+  [14] Probar cadena en un autómata
+  [15] Mostrar autómata guardado
   [0]  Salir
 ──────────────────────────────────────────────────────────────
 """
@@ -612,9 +710,7 @@ MENU = """
 
 def main():
     print(BANNER)
-    stored: dict[str, object] = {}     # nombre → NFA | DFA
-
-    # ── helpers ──────────────────────────────────────────────
+    stored: dict[str, object] = {}
 
     def save(aut, default="A"):
         name = input(f"  Nombre para guardar [{default}]: ").strip() or default
@@ -637,17 +733,13 @@ def main():
         print(f"  ('{name}' es AFN-ε, convirtiéndolo a AFD automáticamente…)")
         return nfa_to_dfa(a)
 
-    # ── bucle ─────────────────────────────────────────────────
-
     while True:
         print(MENU)
         choice = input("Opción: ").strip()
 
-        # ── 0: Salir ─────────────────────────────────────────
         if choice == '0':
             print("¡Hasta luego!"); break
 
-        # ── 1: Regex → AFN-ε ─────────────────────────────────
         elif choice == '1':
             print("\nSintaxis: a·b→ab, unión→|, estrella→*, más→+, opc→?")
             print("Épsilon: ε o @     Agrupación: ()")
@@ -659,7 +751,6 @@ def main():
             except Exception as e:
                 print(f"  [Error] {e}")
 
-        # ── 2: AFN-ε → AFD ───────────────────────────────────
         elif choice == '2':
             aut, name = load("  AFN-ε a convertir")
             if aut is None: continue
@@ -669,13 +760,11 @@ def main():
             dfa.print_automaton(f"AFD  ← '{name}'  [Subconjuntos]")
             save(dfa, f"dfa_{name}")
 
-        # ── 3: Ingreso manual ─────────────────────────────────
         elif choice == '3':
             nfa = input_nfa_manual()
             nfa.print_automaton("AFN ingresado manualmente")
             save(nfa, "nfa_manual")
 
-        # ── 4: Unión ─────────────────────────────────────────
         elif choice == '4':
             print("  Primer autómata (L1):"); a1, n1 = load()
             if a1 is None: continue
@@ -685,7 +774,6 @@ def main():
             result.print_automaton(f"AFN-ε  L1∪L2  ({n1} ∪ {n2})")
             save(result, f"union_{n1}_{n2}")
 
-        # ── 5: Concatenación ──────────────────────────────────
         elif choice == '5':
             print("  Primer autómata (L1):"); a1, n1 = load()
             if a1 is None: continue
@@ -695,7 +783,6 @@ def main():
             result.print_automaton(f"AFN-ε  L1·L2  ({n1} · {n2})")
             save(result, f"concat_{n1}_{n2}")
 
-        # ── 6: Cierre Kleene ──────────────────────────────────
         elif choice == '6':
             aut, name = load("  Autómata para L*")
             if aut is None: continue
@@ -703,7 +790,6 @@ def main():
             result.print_automaton(f"AFN-ε  L*  ({name}*)")
             save(result, f"star_{name}")
 
-        # ── 7: Intersección ───────────────────────────────────
         elif choice == '7':
             print("  Primer autómata (L1):"); a1, n1 = load()
             if a1 is None: continue
@@ -713,7 +799,6 @@ def main():
             result.print_automaton(f"AFD  L1∩L2  ({n1} ∩ {n2})")
             save(result, f"inter_{n1}_{n2}")
 
-        # ── 8: Complemento ────────────────────────────────────
         elif choice == '8':
             aut, name = load()
             if aut is None: continue
@@ -721,7 +806,6 @@ def main():
             result.print_automaton(f"AFD  Complemento  (¬{name})")
             save(result, f"comp_{name}")
 
-        # ── 9: Diferencia ─────────────────────────────────────
         elif choice == '9':
             print("  Primer autómata (L1):"); a1, n1 = load()
             if a1 is None: continue
@@ -731,7 +815,6 @@ def main():
             result.print_automaton(f"AFD  L1−L2  ({n1} − {n2})")
             save(result, f"diff_{n1}_{n2}")
 
-        # ── 10: Reversa ───────────────────────────────────────
         elif choice == '10':
             aut, name = load()
             if aut is None: continue
@@ -739,7 +822,6 @@ def main():
             result.print_automaton(f"AFD  Reversa  ({name}^R)")
             save(result, f"rev_{name}")
 
-        # ── 11: Homomorfismo ──────────────────────────────────
         elif choice == '11':
             aut, name = load()
             if aut is None: continue
@@ -754,7 +836,6 @@ def main():
             result.print_automaton(f"AFD  Homomorfismo de '{name}'")
             save(result, f"hom_{name}")
 
-        # ── 12: Cociente por la derecha ───────────────────────
         elif choice == '12':
             aut, name = load()
             if aut is None: continue
@@ -766,8 +847,21 @@ def main():
             result.print_automaton(f"AFD  Cociente  {name}/{sym}")
             save(result, f"quot_{name}_{sym}")
 
-        # ── 13: Probar cadena ─────────────────────────────────
         elif choice == '13':
+            aut, name = load("  AFD a minimizar")
+            if aut is None: continue
+            d = ensure_dfa(aut, name)
+            before = len(d.states)
+            result = minimize_dfa(d)
+            after  = len(result.states)
+            saved  = before - after
+            result.print_automaton(
+                f"AFD Mínimo  ← '{name}'  "
+                f"[{before} → {after} estados, −{saved} eliminados]"
+            )
+            save(result, f"min_{name}")
+
+        elif choice == '14':
             aut, name = load()
             if aut is None: continue
             cadena = input("  Cadena a probar (Enter = cadena vacía ε): ")
@@ -775,8 +869,7 @@ def main():
             marca = "✓  ACEPTADA" if ok else "✗  RECHAZADA"
             print(f"\n  '{cadena if cadena else 'ε'}' → {marca} por '{name}'\n")
 
-        # ── 14: Mostrar autómata ──────────────────────────────
-        elif choice == '14':
+        elif choice == '15':
             aut, name = load()
             if aut is None: continue
             aut.print_automaton(name)

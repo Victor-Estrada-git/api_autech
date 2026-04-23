@@ -9,14 +9,15 @@ from regex_logic import (
     automaton_to_regex,
     parse_regex,
     build_nfa,
-    nfa_to_dfa as rl_nfa_to_dfa,   # regex_logic version (para otros endpoints)
+    nfa_to_dfa as rl_nfa_to_dfa,
     minimize_dfa,
     automaton_to_json,
 )
 from lenguajes_regulares import (
     NFA  as LR_NFA,
     DFA  as LR_DFA,
-    nfa_to_dfa as lr_nfa_to_dfa,   # lenguajes_regulares version
+    nfa_to_dfa   as lr_nfa_to_dfa,
+    minimize_dfa as lr_minimize_dfa,
     op_union,
     op_concat,
     op_kleene,
@@ -29,7 +30,7 @@ from lenguajes_regulares import (
 )
 from turing_logic import simulate_turing, parse_transitions, build_graph_json
 
-app = FastAPI(title="Automata API", version="2.0")
+app = FastAPI(title="Automata API", version="2.1")
 
 app.add_middleware(
     CORSMiddleware,
@@ -158,7 +159,6 @@ async def automaton_to_regex_endpoint(data: AutomatonToRegexRequest):
     """
     try:
         alphabet = set(data.alphabet) if data.alphabet else None
-        # If alphabet not provided, infer from transitions
         if not alphabet:
             alphabet = set()
             for trans in data.transitions.values():
@@ -183,10 +183,11 @@ async def automaton_to_regex_endpoint(data: AutomatonToRegexRequest):
 
 
 class LanguageOperationRequest(BaseModel):
-    operation: str          # "union" | "intersection" | "kleene" | "complement"
+    operation: str
     regex1: Optional[str] = None
-    regex2: Optional[str] = None   # only for binary ops
-
+    regex2: Optional[str] = None
+    mapping: Optional[Dict[str, str]] = None
+    symbol: Optional[str] = None
 
 
 # ─── Helpers: lenguajes_regulares ↔ automaton_to_json ─────────────────────────
@@ -206,7 +207,6 @@ def _build_lr_dfa(regex: str) -> LR_DFA:
 def _lr_to_json(automaton) -> dict:
     """
     Convierte un NFA o DFA de lenguajes_regulares al formato de automaton_to_json.
-    Los estados pueden ser objetos State (con .name) o strings.
     """
     if isinstance(automaton, LR_NFA):
         automaton = lr_nfa_to_dfa(automaton)
@@ -230,7 +230,7 @@ async def regex_operation(data: LanguageOperationRequest):
     """
     Aplica una operación de lenguaje sobre uno o dos DFAs construidos desde regex.
 
-    Todas las operaciones se resuelven en el servidor usando lenguajes_regulares.py:
+    Operaciones soportadas:
       Unarias  : kleene | complement | reverse
       Binarias : union | intersection | difference | concat
       Con param: homomorphism (mapping: dict) | rightquotient (symbol: str)
@@ -244,41 +244,32 @@ async def regex_operation(data: LanguageOperationRequest):
         op   = data.operation.lower()
         dfa1 = _build_lr_dfa(data.regex1)
 
-        # ── Operaciones unarias ────────────────────────────────────────────────
         if op == "kleene":
             result = op_kleene(dfa1)
-
         elif op == "complement":
             result = op_complement(dfa1)
-
         elif op == "reverse":
             result = op_reverse(dfa1)
-
         elif op == "homomorphism":
             if not data.mapping:
                 raise ValueError("Se requiere el campo 'mapping' para homomorfismo.")
             result = op_homomorphism(dfa1, data.mapping)
-
         elif op == "rightquotient":
             if not data.symbol:
                 raise ValueError("Se requiere el campo 'symbol' para cociente derecho.")
             result = op_right_quotient(dfa1, data.symbol)
-
-        # ── Operaciones binarias ───────────────────────────────────────────────
         elif op in ("union", "intersection", "difference", "concat"):
             if not data.regex2:
                 raise ValueError(f"La operacion '{op}' requiere regex2.")
             dfa2 = _build_lr_dfa(data.regex2)
-
             if op == "union":
                 result = op_union(dfa1, dfa2)
             elif op == "intersection":
                 result = op_intersection(dfa1, dfa2)
             elif op == "difference":
                 result = op_difference(dfa1, dfa2)
-            else:  # concat
+            else:
                 result = op_concat(dfa1, dfa2)
-
         else:
             raise ValueError(
                 f"Operacion desconocida: '{op}'. "
@@ -292,6 +283,131 @@ async def regex_operation(data: LanguageOperationRequest):
         raise HTTPException(status_code=400, detail=str(e))
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
+
+# ─── Minimización de AFD ──────────────────────────────────────────────────────
+
+class MinimizeRequest(BaseModel):
+    """
+    Recibe un AFD en formato de grafo (idéntico al que devuelve AutomatonCanvas)
+    y devuelve el AFD mínimo equivalente.
+
+    Campos:
+      states     : lista de { "id": str, "initial": bool, "accepting": bool }
+      edges      : lista de { "from": str, "to": str, "label": str }
+                   (label puede ser "a,b" para múltiples símbolos en una arista)
+      alphabet   : lista de símbolos (opcional; se infiere si no se pasa)
+    """
+    states: List[Dict[str, Any]]
+    edges: List[Dict[str, Any]]
+    alphabet: Optional[List[str]] = None
+
+
+def _graph_to_lr_dfa(
+    states: List[Dict[str, Any]],
+    edges: List[Dict[str, Any]],
+    alphabet: Optional[List[str]],
+) -> LR_DFA:
+    """
+    Convierte el formato de grafo (states + edges) en un LR_DFA.
+    Primero construye un NFA (para soportar entradas NFA-ε) y luego
+    lo convierte a DFA mediante construcción de subconjuntos.
+    """
+    from lenguajes_regulares import State as LRState
+
+    # Crear objetos State
+    state_map = {s["id"]: LRState(s["id"]) for s in states}
+
+    # Determinar estado inicial y estados de aceptación
+    initial_id   = next((s["id"] for s in states
+                         if s.get("initial") or s.get("is_initial")), None)
+    accept_ids   = {s["id"] for s in states
+                    if s.get("accepting") or s.get("is_accepting")}
+
+    if initial_id is None and states:
+        initial_id = states[0]["id"]
+
+    # Construir transiciones NFA (soporta múltiples destinos y ε)
+    nfa_trans: dict = {}
+    alpha_inferred: set[str] = set()
+
+    for e in edges:
+        frm   = e.get("from", "")
+        to    = e.get("to", "")
+        label = e.get("label", "")
+        syms  = [s.strip() for s in label.split(",") if s.strip()]
+        for sym in syms:
+            src_obj = state_map.get(frm)
+            dst_obj = state_map.get(to)
+            if src_obj is None or dst_obj is None:
+                continue
+            nfa_trans.setdefault(src_obj, {}).setdefault(sym, set()).add(dst_obj)
+            if sym != "ε":
+                alpha_inferred.add(sym)
+
+    # Alfabeto explícito tiene prioridad
+    if alphabet:
+        alpha_set = set(alphabet)
+    else:
+        alpha_set = alpha_inferred
+
+    start_obj   = state_map.get(initial_id)
+    accept_objs = {state_map[aid] for aid in accept_ids if aid in state_map}
+
+    nfa = LR_NFA(
+        set(state_map.values()),
+        alpha_set,
+        nfa_trans,
+        start_obj,
+        accept_objs,
+    )
+
+    return lr_nfa_to_dfa(nfa)
+
+
+@app.post("/automaton/minimize")
+async def automaton_minimize(data: MinimizeRequest):
+    """
+    Minimiza un AFD (o AFN, que se convierte primero a AFD).
+
+    Entrada : { "states": [...], "edges": [...], "alphabet": [...] }
+    Salida  : {
+                "states": [...],   ← grafo del AFD mínimo
+                "edges":  [...],
+                "alphabet": [...],
+                "stats": {
+                  "before": N,     ← estados antes de minimizar
+                  "after":  M,     ← estados después
+                  "saved":  N-M    ← estados eliminados
+                }
+              }
+    """
+    try:
+        if not data.states:
+            raise ValueError("El autómata está vacío.")
+
+        # Convertir grafo → LR_DFA
+        dfa_before = _graph_to_lr_dfa(data.states, data.edges, data.alphabet)
+        before_count = len(dfa_before.states)
+
+        # Minimizar
+        dfa_min = lr_minimize_dfa(dfa_before)
+        after_count = len(dfa_min.states)
+
+        # Convertir resultado → formato de grafo
+        result = _lr_to_json(dfa_min)
+        result["stats"] = {
+            "before": before_count,
+            "after":  after_count,
+            "saved":  before_count - after_count,
+        }
+        return result
+
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
 
 # ─── Turing ───────────────────────────────────────────────────────────────────
 
@@ -312,10 +428,9 @@ async def turing_simulate(data: TuringRequest):
     Retorna: { "steps": [...], "result": "ACCEPTED"|"REJECTED"|"TIMEOUT" }
     """
     try:
-        estados = [s.strip() for s in data.states.split(',') if s.strip()]
+        estados   = [s.strip() for s in data.states.split(',') if s.strip()]
         aceptados = [s.strip() for s in data.accepts.split(',') if s.strip()]
         trans_dict = parse_transitions(data.transitions)
-
         resultado = simulate_turing(
             states=estados,
             transitions=trans_dict,
@@ -337,10 +452,9 @@ async def turing_graph(data: TuringRequest):
     Retorna: { "states": [...], "edges": [...] }
     """
     try:
-        estados = [s.strip() for s in data.states.split(',') if s.strip()]
+        estados   = [s.strip() for s in data.states.split(',') if s.strip()]
         aceptados = [s.strip() for s in data.accepts.split(',') if s.strip()]
         trans_dict = parse_transitions(data.transitions)
-
         graph = build_graph_json(
             states=estados,
             transitions=trans_dict,
@@ -358,6 +472,7 @@ async def turing_graph(data: TuringRequest):
 async def root():
     return {
         "status": "ok",
+        "version": "2.1",
         "endpoints": [
             "POST /pda/validate",
             "POST /pda/simulate",
@@ -365,6 +480,7 @@ async def root():
             "GET  /regex/to-automaton?exp=<regex>",
             "POST /regex/automaton-to-regex",
             "POST /regex/operation  (union|intersection|kleene|complement|difference|concat|reverse|homomorphism|rightquotient)",
+            "POST /automaton/minimize  ← NUEVO: minimiza cualquier AFD/AFN",
             "POST /turing/simulate",
             "POST /turing/graph",
         ],
