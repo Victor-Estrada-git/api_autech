@@ -499,42 +499,82 @@ def dfa_to_nfa(dfa):
 # OPERACIONES SOBRE LENGUAJES REGULARES
 # ══════════════════════════════════════════════════════════════
 
+def _rename_nfa(nfa, prefix):
+    """
+    Devuelve una copia del NFA con todos los estados renombrados con
+    un prefijo único. Necesario porque dos DFAs creados con nfa_to_dfa
+    en llamadas independientes usan los mismos nombres ('D0','D1',...)
+    y colisionarían al combinarse con Thompson.
+    """
+    mapping = {s: State(f"{prefix}{str(s)}") for s in nfa.states}
+    new_trans = {}
+    for s, t in nfa.transitions.items():
+        if s not in mapping:
+            continue
+        new_trans[mapping[s]] = {
+            sym: {mapping[d] for d in dsts if d in mapping}
+            for sym, dsts in t.items()
+        }
+    return NFA(
+        set(mapping.values()),
+        set(nfa.alphabet),
+        new_trans,
+        mapping[nfa.start],
+        {mapping[a] for a in nfa.accept if a in mapping},
+    )
+
+
 # ── 1. OPERACIONES DE DEFINICIÓN ──────────────────────────────
 
 def op_union(a1, a2):
     """L1 ∪ L2 — todas las cadenas en L1 o en L2."""
     n1 = a1 if isinstance(a1, NFA) else dfa_to_nfa(a1)
     n2 = a2 if isinstance(a2, NFA) else dfa_to_nfa(a2)
+    # Renombrar para garantizar estados únicos antes de combinar
+    n1 = _rename_nfa(n1, "U1_")
+    n2 = _rename_nfa(n2, "U2_")
     return thompson_union(n1, n2)
 
 def op_concat(a1, a2):
     """L1 · L2 — concatenación de cadenas."""
     n1 = a1 if isinstance(a1, NFA) else dfa_to_nfa(a1)
     n2 = a2 if isinstance(a2, NFA) else dfa_to_nfa(a2)
+    n1 = _rename_nfa(n1, "C1_")
+    n2 = _rename_nfa(n2, "C2_")
     return thompson_concat(n1, n2)
 
 def op_kleene(a):
     """L* — cero o más repeticiones."""
     n = a if isinstance(a, NFA) else dfa_to_nfa(a)
+    n = _rename_nfa(n, "K_")
     return thompson_star(n)
 
 
 # ── 2. PROPIEDADES DE CERRADURA ───────────────────────────────
 
-def op_intersection(a1, a2):
-    """L1 ∩ L2 — Producto cartesiano de estados."""
+def _product_dfa(a1, a2, accept_pred):
+    """
+    Producto cartesiano de dos AFD.  Recorre solo los estados alcanzables
+    y usa accept_pred(b1, b2) para decidir qué pares (s1,s2) son finales.
+    Usado por intersección y diferencia.
+    """
     d1 = (a1 if isinstance(a1, DFA) else nfa_to_dfa(a1)).complete()
     d2 = (a2 if isinstance(a2, DFA) else nfa_to_dfa(a2)).complete()
     alpha = d1.alphabet | d2.alphabet
-    start = (d1.start, d2.start)
-    queue = deque([start]); visited = set()
-    trans = {}; acc = set()
-    name = lambda p: f"({p[0]},{p[1]})"
+    name  = lambda p: f"({p[0]},{p[1]})"
+
+    start   = (d1.start, d2.start)
+    queue   = deque([start])
+    visited = set()
+    trans   = {}
+    acc     = set()
+
     while queue:
         (s1, s2) = queue.popleft()
-        if (s1, s2) in visited: continue
+        if (s1, s2) in visited:
+            continue
         visited.add((s1, s2))
-        if s1 in d1.accept and s2 in d2.accept:
+        if accept_pred(s1 in d1.accept, s2 in d2.accept):
             acc.add(name((s1, s2)))
         for sym in sorted(alpha):
             t1 = d1.transitions.get(s1, {}).get(sym, "∅")
@@ -543,7 +583,13 @@ def op_intersection(a1, a2):
             trans.setdefault(name((s1, s2)), {})[sym] = name(nxt)
             if nxt not in visited:
                 queue.append(nxt)
+
     return DFA({name(p) for p in visited}, alpha, trans, name(start), acc)
+
+
+def op_intersection(a1, a2):
+    """L1 ∩ L2 — producto cartesiano (acepta cuando ambos aceptan)."""
+    return _product_dfa(a1, a2, lambda b1, b2: b1 and b2)
 
 
 def op_complement(a):
@@ -553,8 +599,8 @@ def op_complement(a):
 
 
 def op_difference(a1, a2):
-    """L1 − L2 = L1 ∩ L̄2"""
-    return op_intersection(a1, op_complement(a2))
+    """L1 − L2 — producto cartesiano (acepta cuando L1 sí y L2 no)."""
+    return _product_dfa(a1, a2, lambda b1, b2: b1 and not b2)
 
 
 # ── 3. OPERACIONES DE TRANSFORMACIÓN ─────────────────────────
@@ -610,6 +656,148 @@ def op_right_quotient(a, symbol):
         if dfa.transitions.get(s, {}).get(symbol) in dfa.accept
     }
     return DFA(dfa.states, dfa.alphabet, dfa.transitions, dfa.start, new_acc)
+
+
+# ══════════════════════════════════════════════════════════════
+# CONVERSIÓN AFD → EXPRESIÓN REGULAR  (Eliminación de estados)
+# ══════════════════════════════════════════════════════════════
+#
+# Usado por las operaciones sobre lenguajes para entregar el
+# RESULTADO como expresión regular (no como autómata).  Seguimos
+# calculando con autómatas, pero al final colapsamos el AFD a una
+# regex equivalente mediante el algoritmo clásico de eliminación
+# de estados (state-elimination generalizado / Brzozowski).
+# ══════════════════════════════════════════════════════════════
+
+def _rx_has_toplevel_union(r):
+    """¿La regex r contiene un '|' fuera de paréntesis?"""
+    if r is None or len(r) <= 1:
+        return False
+    depth = 0
+    for c in r:
+        if   c == '(': depth += 1
+        elif c == ')': depth -= 1
+        elif c == '|' and depth == 0:
+            return True
+    return False
+
+
+def _rx_is_single_group(r):
+    """¿r es de la forma (…) donde el paréntesis externo cubre TODO r?"""
+    if r is None or len(r) < 2 or r[0] != '(' or r[-1] != ')':
+        return False
+    depth = 0
+    for i, c in enumerate(r):
+        if   c == '(': depth += 1
+        elif c == ')':
+            depth -= 1
+            if depth == 0 and i < len(r) - 1:
+                return False
+    return True
+
+
+def _rx_star(r):
+    """Aplica clausura de Kleene:  r → r*  (añade paréntesis si hacen falta)."""
+    if r is None or r == '' or r == EPSILON:
+        return EPSILON
+    if r.endswith('*'):                      # (r*)* = r*
+        return r
+    if len(r) == 1 or _rx_is_single_group(r):
+        return r + '*'
+    return f'({r})*'
+
+
+def _rx_concat(a, b):
+    """Concatena dos regex, parentizando operandos con '|' en el nivel superior."""
+    if a is None or b is None:
+        return None
+    if a == EPSILON: return b
+    if b == EPSILON: return a
+    la = f'({a})' if _rx_has_toplevel_union(a) else a
+    lb = f'({b})' if _rx_has_toplevel_union(b) else b
+    return la + lb
+
+
+def _rx_union(a, b):
+    """Unión de dos regex (sin paréntesis externos)."""
+    if a is None: return b
+    if b is None: return a
+    if a == b:    return a
+    return f'{a}|{b}'
+
+
+def dfa_to_regex(dfa):
+    """
+    Convierte un AFD a una expresión regular equivalente mediante el
+    algoritmo de ELIMINACIÓN DE ESTADOS.
+
+    Procedimiento:
+      1. Se añade un estado inicial ficticio S y uno final ficticio E.
+         S ──ε──► inicio_real       cada_aceptador ──ε──► E
+      2. Si hay varios símbolos entre dos estados se agrupan con '|'.
+      3. Se eliminan los estados reales uno a uno, componiendo:
+             R(i,j)  ∪=  R(i,q) · R(q,q)* · R(q,j)
+      4. La regex final es la etiqueta de S → E.
+
+    Siempre devuelve una cadena:
+      · lenguaje vacío  → '∅'
+      · lenguaje {ε}    → 'ε'
+    """
+    if not dfa.states or not dfa.accept:
+        return '∅'
+
+    state_names = {str(s) for s in dfa.states}
+    initial     = str(dfa.start)
+    accept_set  = {str(s) for s in dfa.accept}
+
+    if initial not in state_names:
+        return '∅'
+
+    # Agrupar (src,dst) → lista de símbolos
+    trans_map: dict = {}
+    for src, t in dfa.transitions.items():
+        src_s = str(src)
+        if src_s not in state_names:
+            continue
+        for sym, tgt in t.items():
+            tgt_s = str(tgt)
+            if tgt_s in state_names:
+                trans_map.setdefault((src_s, tgt_s), []).append(sym)
+
+    NEW_START, NEW_END = '__S__', '__E__'
+    nodes = [NEW_START] + sorted(state_names) + [NEW_END]
+    R = {i: {j: None for j in nodes} for i in nodes}
+
+    # Transiciones ficticias
+    R[NEW_START][initial] = EPSILON
+    for acc in accept_set:
+        R[acc][NEW_END] = EPSILON
+
+    # Transiciones reales (varios símbolos → unidos con '|')
+    for (src_s, tgt_s), syms in trans_map.items():
+        syms = sorted(set(syms))
+        R[src_s][tgt_s] = syms[0] if len(syms) == 1 else '|'.join(syms)
+
+    # Eliminar estados reales uno por uno
+    for q in sorted(state_names):
+        loop = R[q][q]
+
+        for i in nodes:
+            if i == q or R[i][q] is None:
+                continue
+            riq = R[i][q]
+            for j in nodes:
+                if j == q or R[q][j] is None:
+                    continue
+                rqj    = R[q][j]
+                middle = riq if loop is None else _rx_concat(riq, _rx_star(loop))
+                new_rx = _rx_concat(middle, rqj)
+                R[i][j] = _rx_union(R[i][j], new_rx)
+
+        nodes.remove(q)   # q ya no se consulta más
+
+    result = R[NEW_START][NEW_END]
+    return result if result else '∅'
 
 
 # ══════════════════════════════════════════════════════════════

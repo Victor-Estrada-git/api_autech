@@ -18,6 +18,7 @@ from lenguajes_regulares import (
     DFA  as LR_DFA,
     nfa_to_dfa   as lr_nfa_to_dfa,
     minimize_dfa as lr_minimize_dfa,
+    dfa_to_regex as lr_dfa_to_regex,
     op_union,
     op_concat,
     op_kleene,
@@ -228,14 +229,15 @@ def _lr_to_json(automaton) -> dict:
 @app.post("/regex/operation")
 async def regex_operation(data: LanguageOperationRequest):
     """
-    Aplica una operación de lenguaje sobre uno o dos DFAs construidos desde regex.
+    Aplica una operación de lenguaje sobre uno o dos DFAs construidos desde regex,
+    y devuelve la EXPRESIÓN REGULAR del lenguaje resultante (no el autómata).
 
     Operaciones soportadas:
       Unarias  : kleene | complement | reverse
       Binarias : union | intersection | difference | concat
       Con param: homomorphism (mapping: dict) | rightquotient (symbol: str)
 
-    Respuesta: { "states": [...], "edges": [...], "alphabet": [...] }
+    Respuesta: { "regex": "<expresión regular del lenguaje resultante>" }
     """
     try:
         if not data.regex1:
@@ -277,7 +279,12 @@ async def regex_operation(data: LanguageOperationRequest):
                 "difference, concat, reverse, homomorphism, rightquotient."
             )
 
-        return _lr_to_json(result)
+        # Normalizar el resultado a un AFD minimizado y obtener la regex
+        final_dfa = result if isinstance(result, LR_DFA) else lr_nfa_to_dfa(result)
+        final_dfa = lr_minimize_dfa(final_dfa)
+        regex_result = lr_dfa_to_regex(final_dfa)
+
+        return {"regex": regex_result}
 
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
@@ -479,7 +486,7 @@ async def root():
             "POST /pda/to-cfg",
             "GET  /regex/to-automaton?exp=<regex>",
             "POST /regex/automaton-to-regex",
-            "POST /regex/operation  (union|intersection|kleene|complement|difference|concat|reverse|homomorphism|rightquotient)",
+            "POST /regex/operation  → { regex } del lenguaje resultante (union|intersection|kleene|complement|difference|concat|reverse|homomorphism|rightquotient)",
             "POST /automaton/minimize  ← NUEVO: minimiza cualquier AFD/AFN",
             "POST /turing/simulate",
             "POST /turing/graph",
