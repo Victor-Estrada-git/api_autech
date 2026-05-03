@@ -159,6 +159,17 @@ async def automaton_to_regex_endpoint(data: AutomatonToRegexRequest):
     Respuesta: { "regex": "<expresión regular>" }
     """
     try:
+        # FIX 1: validar que el estado inicial exista en la lista de estados
+        if data.initial not in data.states:
+            raise HTTPException(
+                status_code=400,
+                detail=f"El estado inicial '{data.initial}' no existe en la lista de estados."
+            )
+
+        # FIX 2: autómata sin estados de aceptación → lenguaje vacío (∅), no es un error
+        if not data.accepting:
+            return {"regex": "∅"}
+
         alphabet = set(data.alphabet) if data.alphabet else None
         if not alphabet:
             alphabet = set()
@@ -177,6 +188,8 @@ async def automaton_to_regex_endpoint(data: AutomatonToRegexRequest):
             alphabet=alphabet,
         )
         return {"regex": regex}
+    except HTTPException:
+        raise
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
     except Exception as e:
@@ -437,17 +450,28 @@ async def turing_simulate(data: TuringRequest):
     try:
         estados   = [s.strip() for s in data.states.split(',') if s.strip()]
         aceptados = [s.strip() for s in data.accepts.split(',') if s.strip()]
+        initial   = data.initial.strip()
+
+        # FIX 3: validar que el estado inicial exista en la lista de estados
+        if initial not in estados:
+            raise HTTPException(
+                status_code=400,
+                detail=f"El estado inicial '{initial}' no existe en la lista de estados."
+            )
+
         trans_dict = parse_transitions(data.transitions)
         resultado = simulate_turing(
             states=estados,
             transitions=trans_dict,
-            initial_state=data.initial.strip(),
+            initial_state=initial,
             accept_states=aceptados,
             tape_input=data.cinta,
             head_pos=data.head_pos,
             max_steps=data.max_steps,
         )
         return resultado
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
@@ -461,14 +485,25 @@ async def turing_graph(data: TuringRequest):
     try:
         estados   = [s.strip() for s in data.states.split(',') if s.strip()]
         aceptados = [s.strip() for s in data.accepts.split(',') if s.strip()]
+        initial   = data.initial.strip()
+
+        # Misma validación para consistencia
+        if initial not in estados:
+            raise HTTPException(
+                status_code=400,
+                detail=f"El estado inicial '{initial}' no existe en la lista de estados."
+            )
+
         trans_dict = parse_transitions(data.transitions)
         graph = build_graph_json(
             states=estados,
             transitions=trans_dict,
-            initial=data.initial.strip(),
+            initial=initial,
             accept_states=aceptados,
         )
         return graph
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
