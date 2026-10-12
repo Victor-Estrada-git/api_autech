@@ -260,7 +260,8 @@ def nfa_to_dfa(nfa_states, nfa_transitions, nfa_initial, nfa_final) -> tuple:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  DFA Minimizer (Hopcroft)
+#  DFA Minimizer (refinamiento de particiones, variante de Hopcroft
+#  sin la cola de "la mitad menor"; correcto, pero sin la cota O(n log n))
 # ══════════════════════════════════════════════════════════════════════════════
 
 def minimize_dfa(dfa_states, dfa_transitions, dfa_initial, dfa_accepting, alphabet) -> tuple:
@@ -486,21 +487,31 @@ def _union(r1: Optional[str], r2: Optional[str]) -> Optional[str]:
     return '(' + '|'.join(combined) + ')'
 
 
+def _is_starred_unit(r: str) -> bool:
+    """
+    True si *r* es exactamente X* con X un solo símbolo o un grupo (…) que
+    cubre todo X. Solo en ese caso (r)* = r*. Una expresión como ab* también
+    termina en '*', pero (ab*)* ≠ ab*, así que NO cuenta.
+    """
+    if len(r) < 2 or not r.endswith('*'):
+        return False
+    base = r[:-1]
+    return len(base) == 1 or _has_outer_parens(base)
+
+
 def _star(r: Optional[str]) -> str:
     if r is None or r == 'ε':
         return 'ε'
     if len(r) == 1:
         return f'{r}*'
-    # If r already has outer parens (e.g. (a|b)), use r* directly
-    if _has_outer_parens(r):
-        # Check for idempotent star  (r*)* → r*
-        inner = r[1:-1]
-        if inner.endswith('*'):
-            return r[1:-1]    # strip outer parens  → r* unchanged
-        return f'{r}*'
-    # If r is already starred, it's idempotent
-    if r.endswith('*'):
+    # Idempotencia (X*)* = X*, solo cuando r es una unidad estrellada.
+    if _is_starred_unit(r):
         return r
+    if _has_outer_parens(r):
+        inner = r[1:-1]
+        if _is_starred_unit(inner):
+            return inner      # (X*) → X*
+        return f'{r}*'
     return f'({r})*'
 
 

@@ -143,8 +143,12 @@ class PDA:
 class PDASimulator:
     def __init__(self, pda: PDA):
         self.pda        = pda
-        self.max_steps  = 2000
-        self.max_stack_size = 200
+        # Límites de la búsqueda en anchura. Si se alcanzan sin haber
+        # aceptado, el resultado es "no concluyente" (la cadena podría ser
+        # aceptada por una rama que no se exploró), no un rechazo.
+        self.max_steps  = 10000
+        self.max_stack_size = 500
+        self._pruned = False
 
     def simulate(self, input_string: str) -> Dict[str, Any]:
         if not self.pda.states or not self.pda.start_state or not self.pda.start_symbol:
@@ -155,6 +159,7 @@ class PDASimulator:
         visited = {(self.pda.start_state, len(input_string), (self.pda.start_symbol,))}
         trace   = [self._fmt(initial, 0, "Configuración inicial")]
         step    = 0
+        self._pruned = False
 
         while queue and step < self.max_steps:
             step += 1
@@ -167,10 +172,20 @@ class PDASimulator:
             if inp:
                 self._explore(state, inp[0], inp[1:], stack, queue, visited, trace, step)
 
-        if step >= self.max_steps:
+        hit_steps = bool(queue) and step >= self.max_steps
+        inconclusive = hit_steps or self._pruned
+        if hit_steps:
             trace.append(f"⚠️ Límite de {self.max_steps} pasos alcanzado.")
-        trace.append("❌ Cadena RECHAZADA")
-        return {'accepted': False, 'trace': trace, 'steps': step}
+        if self._pruned:
+            trace.append(f"⚠️ Se descartaron ramas con más de "
+                         f"{self.max_stack_size} símbolos en la pila.")
+        if inconclusive:
+            trace.append("⚠️ Resultado NO CONCLUYENTE: no se encontró una rama "
+                         "que acepte dentro de los límites, pero podría existir.")
+        else:
+            trace.append("❌ Cadena RECHAZADA")
+        return {'accepted': False, 'inconclusive': inconclusive,
+                'trace': trace, 'steps': step}
 
     def _explore(self, state, char, inp_after, stack, queue, visited, trace, step):
         top = stack[-1] if stack else None
@@ -185,16 +200,18 @@ class PDASimulator:
             for next_state, push_syms in self.pda.transitions[key]:
                 new_stack = list(stack_after_pop)
                 new_stack.extend(reversed(push_syms))
-                if len(new_stack) <= self.max_stack_size:
-                    cfg_key = (next_state, len(inp_after), tuple(new_stack))
-                    if cfg_key not in visited:
-                        visited.add(cfg_key)
-                        new_cfg = (next_state, inp_after, new_stack)
-                        queue.append(new_cfg)
-                        push_s = "".join(push_syms) or EPSILON
-                        move   = f"Leer '{char}'" if char != EPSILON else "ε-movimiento"
-                        trace.append(self._fmt(new_cfg, step,
-                                               f"{move}, Pop '{sym_pop}', Push '{push_s}'"))
+                if len(new_stack) > self.max_stack_size:
+                    self._pruned = True
+                    continue
+                cfg_key = (next_state, len(inp_after), tuple(new_stack))
+                if cfg_key not in visited:
+                    visited.add(cfg_key)
+                    new_cfg = (next_state, inp_after, new_stack)
+                    queue.append(new_cfg)
+                    push_s = "".join(push_syms) or EPSILON
+                    move   = f"Leer '{char}'" if char != EPSILON else "ε-movimiento"
+                    trace.append(self._fmt(new_cfg, step,
+                                           f"{move}, Pop '{sym_pop}', Push '{push_s}'"))
 
     def _fmt(self, cfg, step, move=None):
         state, inp, stack = cfg
@@ -209,8 +226,13 @@ class PDASimulator:
 # ══════════════════════════════════════════════════════════════════════════════
 
 def _is_cfg_nt(sym: str) -> bool:
-    """A symbol is a non-terminal if it is 'S' or matches the [q,A,p] pattern."""
-    return sym == 'S' or (sym.startswith('[') and sym.endswith(']'))
+    """
+    Un símbolo es no terminal si es 'S' o tiene la forma [q,A,p]. Los nombres
+    que crea la factorización agregan un sufijo (S'1, [q,A,p]'2): se ignora
+    para que el recorrido en anchura también los encuentre.
+    """
+    base = sym.split("'", 1)[0] if "'" in sym and not sym.startswith("'") else sym
+    return base == 'S' or (base.startswith('[') and base.endswith(']'))
 
 
 def _find_generating_nts(productions: Dict[str, List[List[str]]]) -> Set[str]:

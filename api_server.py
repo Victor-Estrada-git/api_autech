@@ -1,3 +1,4 @@
+import logging
 import os
 import time
 from collections import defaultdict, deque
@@ -37,7 +38,7 @@ from lenguajes_regulares import (
 )
 from turing_logic import simulate_turing, parse_transitions, build_graph_json
 
-app = FastAPI(title="Automata API", version="2.2")
+app = FastAPI(title="Automata API", version="2.3")
 
 app.add_middleware(
     CORSMiddleware,
@@ -45,6 +46,23 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+# ─── Errores internos ─────────────────────────────────────────────────────────
+
+_log = logging.getLogger("automata_api")
+
+
+def _error_interno(e: Exception) -> HTTPException:
+    """
+    Registra la excepción completa en el log del servidor y devuelve al
+    cliente un mensaje genérico, sin detalles internos de Python.
+    """
+    _log.exception("Error interno: %s", e)
+    return HTTPException(
+        status_code=500,
+        detail="Error interno del servidor. Revisa los datos e inténtalo de nuevo.",
+    )
 
 
 # ─── Errores de validación legibles ───────────────────────────────────────────
@@ -78,6 +96,24 @@ RATE_LIMIT_IP_PER_MIN = int(os.environ.get(
 _peticiones_por_ip: Dict[str, deque] = defaultdict(deque)
 
 
+# Proxies de confianza delante de la API (Render agrega uno). El primer valor
+# de X-Forwarded-For lo puede escribir el propio cliente, así que no sirve
+# para identificarlo: se toma el que agregó el proxy más cercano, contando
+# PROXIES_CONFIABLES posiciones desde el final. 0 = ignorar el encabezado.
+PROXIES_CONFIABLES = int(os.environ.get("PROXIES_CONFIABLES", "1"))
+
+
+def _ip_cliente(request: Request) -> str:
+    directa = request.client.host if request.client else "desconocida"
+    if PROXIES_CONFIABLES <= 0:
+        return directa
+    saltos = [p.strip() for p in request.headers.get("x-forwarded-for", "").split(",")
+              if p.strip()]
+    if len(saltos) >= PROXIES_CONFIABLES:
+        return saltos[-PROXIES_CONFIABLES]
+    return saltos[0] if saltos else directa
+
+
 def _ventana_llena(clave: str, tope: int, ahora: float) -> bool:
     """Ventana deslizante de 60 s: True si la clave ya alcanzó su tope."""
     cola = _peticiones_por_ip[clave]
@@ -86,28 +122,79 @@ def _ventana_llena(clave: str, tope: int, ahora: float) -> bool:
     return tope > 0 and len(cola) >= tope
 
 
+# Conteo compartido entre instancias (opcional). Con una sola instancia basta
+# la memoria del proceso; si se ejecutan varias (réplicas o --workers), cada
+# una contaría por su lado y el límite real se multiplicaría. Con REDIS_URL
+# (p. ej. Render Key Value, Upstash o un Redis propio) todas usan la misma
+# ventana. Si Redis no responde, se vuelve a la memoria del proceso: la API
+# nunca se cae por el limitador.
+REDIS_URL = os.environ.get("REDIS_URL", "").strip()
+_redis = None
+if REDIS_URL:
+    try:
+        import redis.asyncio as _redis_asyncio
+        _redis = _redis_asyncio.from_url(
+            REDIS_URL, socket_timeout=0.5, socket_connect_timeout=0.5)
+    except Exception as e:  # paquete ausente o URL inválida
+        _log.warning("REDIS_URL definido pero no se pudo usar Redis: %s", e)
+
+
+async def _limite_redis(claves_topes, ahora: float) -> bool:
+    """Ventana deslizante de 60 s en Redis (un sorted set por clave).
+    Devuelve True si alguna clave alcanzó su tope; si no, registra la
+    petición en todas."""
+    pipe = _redis.pipeline()
+    for clave, _ in claves_topes:
+        k = f"autech:rl:{clave}"
+        pipe.zremrangebyscore(k, 0, ahora - 60)
+        pipe.zcard(k)
+    res = await pipe.execute()
+    cuentas = res[1::2]
+    if any(t > 0 and n >= t for (_, t), n in zip(claves_topes, cuentas)):
+        return True
+    pipe = _redis.pipeline()
+    miembro = f"{ahora:.6f}-{os.getpid()}-{id(claves_topes)}"
+    for clave, _ in claves_topes:
+        k = f"autech:rl:{clave}"
+        pipe.zadd(k, {miembro: ahora})
+        pipe.expire(k, 61)
+    await pipe.execute()
+    return False
+
+
+def _limite_memoria(claves_topes, ahora: float) -> bool:
+    if any(_ventana_llena(c, t, ahora) for c, t in claves_topes):
+        return True
+    for c, _ in claves_topes:
+        _peticiones_por_ip[c].append(ahora)
+    # Limpieza ocasional para que el diccionario no crezca sin límite.
+    if len(_peticiones_por_ip) > 10000:
+        for k in [k for k, v in _peticiones_por_ip.items() if not v or ahora - v[-1] > 60]:
+            del _peticiones_por_ip[k]
+    return False
+
+
 @app.middleware("http")
 async def _limite_peticiones(request: Request, call_next):
     if RATE_LIMIT_PER_MIN > 0 and request.method != "OPTIONS":
-        reenviada = request.headers.get("x-forwarded-for", "")
-        ip = reenviada.split(",")[0].strip() or (
-            request.client.host if request.client else "desconocida")
+        ip = _ip_cliente(request)
         cliente = request.headers.get("x-cliente-id", "").strip()[:64]
         clave_cliente = f"{ip}|{cliente}" if cliente else ip
-        clave_ip = f"{ip}|*"
-        ahora = time.monotonic()
-        if (_ventana_llena(clave_cliente, RATE_LIMIT_PER_MIN, ahora)
-                or _ventana_llena(clave_ip, RATE_LIMIT_IP_PER_MIN, ahora)):
+        claves_topes = [(clave_cliente, RATE_LIMIT_PER_MIN),
+                        (f"{ip}|*", RATE_LIMIT_IP_PER_MIN)]
+        lleno = None
+        if _redis is not None:
+            try:
+                lleno = await _limite_redis(claves_topes, time.time())
+            except Exception as e:
+                _log.warning("Redis no respondió; límite en memoria: %s", e)
+        if lleno is None:
+            lleno = _limite_memoria(claves_topes, time.monotonic())
+        if lleno:
             return JSONResponse(
                 status_code=429,
                 content={"detail": "Demasiadas peticiones. Espera un momento e inténtalo de nuevo."},
             )
-        _peticiones_por_ip[clave_cliente].append(ahora)
-        _peticiones_por_ip[clave_ip].append(ahora)
-        # Limpieza ocasional para que el diccionario no crezca sin límite.
-        if len(_peticiones_por_ip) > 10000:
-            for k in [k for k, v in _peticiones_por_ip.items() if not v or ahora - v[-1] > 60]:
-                del _peticiones_por_ip[k]
     return await call_next(request)
 
 
@@ -156,14 +243,16 @@ async def pda_validate(data: PDARequest):
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        raise _error_interno(e)
 
 
 @app.post("/pda/simulate")
 async def pda_simulate(data: PDASimRequest):
     """
     Simula el PDA sobre una cadena de entrada.
-    Respuesta: { "accepted": bool, "trace": [...], "steps": int }
+    Respuesta: { "accepted": bool, "inconclusive": bool, "trace": [...], "steps": int }
+    "inconclusive" = true cuando se agotó el límite de búsqueda sin aceptar:
+    la cadena podría ser aceptada por una rama no explorada.
     """
     try:
         pda = PDA()
@@ -178,7 +267,7 @@ async def pda_simulate(data: PDASimRequest):
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        raise _error_interno(e)
 
 
 @app.post("/pda/to-cfg")
@@ -194,7 +283,7 @@ async def pda_to_cfg(data: PDARequest):
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        raise _error_interno(e)
 
 
 # ─── Regex ────────────────────────────────────────────────────────────────────
@@ -211,7 +300,7 @@ async def regex_to_automaton(exp: str):
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        raise _error_interno(e)
 
 
 class AutomatonToRegexRequest(BaseModel):
@@ -263,7 +352,7 @@ async def automaton_to_regex_endpoint(data: AutomatonToRegexRequest):
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        raise _error_interno(e)
 
 
 class LanguageOperationRequest(BaseModel):
@@ -372,7 +461,7 @@ async def regex_operation(data: LanguageOperationRequest):
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        raise _error_interno(e)
 
 
 # ─── Minimización de AFD ──────────────────────────────────────────────────────
@@ -384,6 +473,8 @@ class MinimizeRequest(BaseModel):
 
     Campos:
       states     : lista de { "id": str, "initial": bool, "accepting": bool }
+                   (también se aceptan is_initial/is_accepting e
+                   isInitial/isAccepting, el formato que devuelve la API)
       edges      : lista de { "from": str, "to": str, "label": str }
                    (label puede ser "a,b" para múltiples símbolos en una arista)
       alphabet   : lista de símbolos (opcional; se infiere si no se pasa)
@@ -409,10 +500,14 @@ def _graph_to_lr_dfa(
     state_map = {s["id"]: LRState(s["id"]) for s in states}
 
     # Determinar estado inicial y estados de aceptación
+    # Se aceptan las tres convenciones: initial/accepting, is_initial/
+    # is_accepting e isInitial/isAccepting (la que devuelve la propia API).
     initial_id   = next((s["id"] for s in states
-                         if s.get("initial") or s.get("is_initial")), None)
+                         if s.get("initial") or s.get("is_initial")
+                         or s.get("isInitial")), None)
     accept_ids   = {s["id"] for s in states
-                    if s.get("accepting") or s.get("is_accepting")}
+                    if s.get("accepting") or s.get("is_accepting")
+                    or s.get("isAccepting")}
 
     if initial_id is None and states:
         initial_id = states[0]["id"]
@@ -496,7 +591,7 @@ async def automaton_minimize(data: MinimizeRequest):
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        raise _error_interno(e)
 
 
 # ─── Turing ───────────────────────────────────────────────────────────────────
@@ -566,7 +661,7 @@ async def turing_simulate(data: TuringRequest):
     except HTTPException:
         raise
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        raise _error_interno(e)
 
 
 @app.post("/turing/graph")
@@ -601,7 +696,7 @@ async def turing_graph(data: TuringRequest):
     except HTTPException:
         raise
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        raise _error_interno(e)
 
 
 # ─── Health check ─────────────────────────────────────────────────────────────
@@ -610,7 +705,7 @@ async def turing_graph(data: TuringRequest):
 async def root():
     return {
         "status": "ok",
-        "version": "2.2",
+        "version": "2.3",
         "endpoints": [
             "POST /pda/validate",
             "POST /pda/simulate",

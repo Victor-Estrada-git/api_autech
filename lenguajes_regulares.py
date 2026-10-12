@@ -2,7 +2,7 @@
 ╔══════════════════════════════════════════════════════════════╗
 ║       Operaciones sobre Lenguajes Regulares                  ║
 ║  Construcción de Thompson + Algoritmo de Subconjuntos        ║
-║  + Minimización de AFD (llenado de tabla / Hopcroft)         ║
+║  + Minimización de AFD (llenado de tabla + Union-Find)       ║
 ╚══════════════════════════════════════════════════════════════╝
 
 Operaciones implementadas:
@@ -348,7 +348,7 @@ def nfa_to_dfa(nfa):
 def minimize_dfa(dfa):
     """
     Minimiza un AFD usando el algoritmo de llenado de tabla
-    (equivalente a Myhill-Nerode / Hopcroft simplificado).
+    (Myhill-Nerode: se marcan los pares de estados distinguibles).
 
     Pasos:
       1. Completar el AFD (agregar estado muerto si falta).
@@ -384,6 +384,15 @@ def minimize_dfa(dfa):
     if n == 0:
         return dfa
 
+    # Nombres en texto para aceptación y transiciones: los estados pueden ser
+    # cadenas u objetos State, y 'B' in {State('B')} es falso.
+    acc_names = {str(s) for s in d.accept}
+    tr = {
+        str(s): {sym: (str(t) if t is not None else None)
+                 for sym, t in d.transitions.get(s, {}).items()}
+        for s in reachable
+    }
+
     idx = {s: i for i, s in enumerate(states)}
 
     # ── 3. Tabla de distinguibilidad ─────────────────────────
@@ -392,7 +401,7 @@ def minimize_dfa(dfa):
 
     for i in range(n):
         for j in range(i + 1, n):
-            if (states[i] in d.accept) != (states[j] in d.accept):
+            if (states[i] in acc_names) != (states[j] in acc_names):
                 marked[i][j] = True
 
     changed = True
@@ -403,8 +412,8 @@ def minimize_dfa(dfa):
                 if marked[i][j]:
                     continue
                 for sym in d.alphabet:
-                    ti = d.transitions.get(states[i], {}).get(sym)
-                    tj = d.transitions.get(states[j], {}).get(sym)
+                    ti = tr.get(states[i], {}).get(sym)
+                    tj = tr.get(states[j], {}).get(sym)
                     if ti is None or tj is None:
                         continue
                     ti, tj = str(ti), str(tj)
@@ -454,12 +463,12 @@ def minimize_dfa(dfa):
         rep   = members[0]
         min_trans[gname] = {}
         for sym in d.alphabet:
-            t = d.transitions.get(rep, {}).get(sym)
+            t = tr.get(rep, {}).get(sym)
             if t is not None:
-                tg = state_to_group.get(str(t))
+                tg = state_to_group.get(t)
                 if tg:
                     min_trans[gname][sym] = tg
-        if rep in d.accept:
+        if rep in acc_names:
             min_accept.add(gname)
 
     min_start  = state_to_group[str(d.start)]
@@ -707,7 +716,9 @@ def _rx_star(r):
     """Aplica clausura de Kleene:  r → r*  (añade paréntesis si hacen falta)."""
     if r is None or r == '' or r == EPSILON:
         return EPSILON
-    if r.endswith('*'):                      # (r*)* = r*
+    # (X*)* = X* solo si r es X* con X un símbolo o un grupo completo;
+    # ab* también termina en '*' pero (ab*)* ≠ ab*.
+    if r.endswith('*') and (len(r[:-1]) == 1 or _rx_is_single_group(r[:-1])):
         return r
     if len(r) == 1 or _rx_is_single_group(r):
         return r + '*'
