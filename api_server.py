@@ -66,8 +66,24 @@ async def _validacion_legible(request: Request, exc: RequestValidationError):
 # sensibles). Para que nadie la sature se limita el número de peticiones por
 # IP en una ventana de 60 s. El tope es amplio porque un salón entero puede
 # salir por la misma IP. RATE_LIMIT_PER_MIN=0 lo desactiva.
+#
+# La app manda X-Cliente-Id (aleatorio por ejecución): el cupo
+# RATE_LIMIT_PER_MIN se cuenta por IP + cliente, así cada teléfono de un salón
+# tiene el suyo aunque todos salgan por la misma IP. Para que inventar
+# identificadores no permita saturar el servidor, además hay un tope general
+# por IP, RATE_LIMIT_IP_PER_MIN (por omisión 10 veces el cupo individual).
 RATE_LIMIT_PER_MIN = int(os.environ.get("RATE_LIMIT_PER_MIN", "600"))
+RATE_LIMIT_IP_PER_MIN = int(os.environ.get(
+    "RATE_LIMIT_IP_PER_MIN", str(RATE_LIMIT_PER_MIN * 10)))
 _peticiones_por_ip: Dict[str, deque] = defaultdict(deque)
+
+
+def _ventana_llena(clave: str, tope: int, ahora: float) -> bool:
+    """Ventana deslizante de 60 s: True si la clave ya alcanzó su tope."""
+    cola = _peticiones_por_ip[clave]
+    while cola and ahora - cola[0] > 60:
+        cola.popleft()
+    return tope > 0 and len(cola) >= tope
 
 
 @app.middleware("http")
@@ -76,16 +92,18 @@ async def _limite_peticiones(request: Request, call_next):
         reenviada = request.headers.get("x-forwarded-for", "")
         ip = reenviada.split(",")[0].strip() or (
             request.client.host if request.client else "desconocida")
+        cliente = request.headers.get("x-cliente-id", "").strip()[:64]
+        clave_cliente = f"{ip}|{cliente}" if cliente else ip
+        clave_ip = f"{ip}|*"
         ahora = time.monotonic()
-        cola = _peticiones_por_ip[ip]
-        while cola and ahora - cola[0] > 60:
-            cola.popleft()
-        if len(cola) >= RATE_LIMIT_PER_MIN:
+        if (_ventana_llena(clave_cliente, RATE_LIMIT_PER_MIN, ahora)
+                or _ventana_llena(clave_ip, RATE_LIMIT_IP_PER_MIN, ahora)):
             return JSONResponse(
                 status_code=429,
                 content={"detail": "Demasiadas peticiones. Espera un momento e inténtalo de nuevo."},
             )
-        cola.append(ahora)
+        _peticiones_por_ip[clave_cliente].append(ahora)
+        _peticiones_por_ip[clave_ip].append(ahora)
         # Limpieza ocasional para que el diccionario no crezca sin límite.
         if len(_peticiones_por_ip) > 10000:
             for k in [k for k, v in _peticiones_por_ip.items() if not v or ahora - v[-1] > 60]:
