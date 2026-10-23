@@ -248,7 +248,7 @@ def nfa_to_dfa(nfa_states, nfa_transitions, nfa_initial, nfa_final) -> tuple:
     for s in list(dfa_states):
         if s not in dfa_transitions:
             dfa_transitions[s] = {}
-        for sym in alphabet:
+        for sym in sorted(alphabet):
             if sym not in dfa_transitions[s]:
                 if not has_trap:
                     dfa_states.append(trap)
@@ -280,7 +280,7 @@ def minimize_dfa(dfa_states, dfa_transitions, dfa_initial, dfa_accepting, alphab
         part = worklist.popleft()
         if not part:
             continue
-        for sym in alphabet:
+        for sym in sorted(alphabet):
             preds = {s for s in states if dfa_transitions.get(s, {}).get(sym) in part}
             new_parts, changed = [], False
             for P in partitions:
@@ -307,7 +307,7 @@ def minimize_dfa(dfa_states, dfa_transitions, dfa_initial, dfa_accepting, alphab
             continue
         name = f"Min{i}"
         min_states.append(name)
-        rep = next(iter(partition))
+        rep = min(partition)  # cualquiera sirve; min() lo hace reproducible
         state_reps[name] = rep
         for s in partition:
             min_state_map[s] = name
@@ -320,7 +320,7 @@ def minimize_dfa(dfa_states, dfa_transitions, dfa_initial, dfa_accepting, alphab
     for name in min_states:
         rep = state_reps[name]
         min_transitions[name] = {}
-        for sym in alphabet:
+        for sym in sorted(alphabet):
             dest = dfa_transitions.get(rep, {}).get(sym)
             if dest and dest in min_state_map:
                 min_transitions[name][sym] = min_state_map[dest]

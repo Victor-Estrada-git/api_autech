@@ -9,6 +9,13 @@ from collections import deque
 from typing import Dict, Set, Tuple, List, Optional, Any
 
 EPSILON = 'ε'
+# 'λ' es otra notación de la cadena vacía (la app acepta ambas, igual que
+# automaton_rules.dart); se normaliza a ε al leer la definición.
+LAMBDA = 'λ'
+
+
+def _norm_eps(sym: str) -> str:
+    return EPSILON if sym == LAMBDA else sym
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -21,7 +28,7 @@ class PDA:
         self.input_alphabet: Set[str]  = set()
         self.stack_alphabet: Set[str]  = set()
         self.transitions:    Dict[Tuple[str, str, str],
-                                   Set[Tuple[str, Tuple[str, ...]]]] = {}
+                                   List[Tuple[str, Tuple[str, ...]]]] = {}
         self.start_state:    Optional[str] = None
         self.start_symbol:   Optional[str] = None
         self.accept_states:  Set[str]  = set()
@@ -44,6 +51,7 @@ class PDA:
         self.states          = clean_split(states_str)
         self.input_alphabet  = clean_split(input_alpha_str)
         self.input_alphabet.discard(EPSILON)
+        self.input_alphabet.discard(LAMBDA)
         self.stack_alphabet  = clean_split(stack_alpha_str)
         self.start_state     = start_state_str.strip()  if start_state_str  else None
         self.start_symbol    = start_symbol_str.strip() if start_symbol_str else None
@@ -64,7 +72,8 @@ class PDA:
 
         invalid_accept = self.accept_states - self.states
         if invalid_accept:
-            errors.append(f"Estados de aceptación inválidos: {invalid_accept}")
+            errors.append("Estados de aceptación inválidos: {"
+                          + ", ".join(sorted(invalid_accept)) + "}")
 
         pattern = re.compile(
             r"^\s*([^,]+)\s*,\s*([^,]+)\s*,\s*([^,]+)\s*->\s*([^,]+)\s*,\s*(.*)\s*$"
@@ -79,6 +88,7 @@ class PDA:
                 errors.append(f"Línea {i}: Formato inválido. Use: 'origen,entrada,pop -> destino,push'")
                 continue
             q_r, inp, pop, q_w, push_str = [x.strip() for x in m.groups()]
+            inp, pop, push_str = _norm_eps(inp), _norm_eps(pop), _norm_eps(push_str)
             if q_r not in self.states:
                 errors.append(f"Línea {i}: Estado '{q_r}' no está en Q.")
             if q_w not in self.states:
@@ -91,7 +101,13 @@ class PDA:
             if push_tup is None:
                 continue
             key = (q_r, inp, pop)
-            processed.setdefault(key, set()).add((q_w, push_tup))
+            # Lista sin repetidos (no set): así la búsqueda explora las
+            # transiciones en el orden en que se escribieron, siempre igual.
+            # Con un set el orden dependía del hash de cada ejecución y, cerca
+            # de los límites de búsqueda, el veredicto podía cambiar.
+            destinos = processed.setdefault(key, [])
+            if (q_w, push_tup) not in destinos:
+                destinos.append((q_w, push_tup))
 
         if errors:
             raise ValueError("\n".join(errors))
@@ -231,7 +247,10 @@ def _is_cfg_nt(sym: str) -> bool:
     que crea la factorización agregan un sufijo (S'1, [q,A,p]'2): se ignora
     para que el recorrido en anchura también los encuentre.
     """
-    base = sym.split("'", 1)[0] if "'" in sym and not sym.startswith("'") else sym
+    # Solo se quitan los sufijos de factorización ('1, '2'5…): antes se
+    # cortaba en el primer apóstrofo y un estado llamado "q_ini'" (el que se
+    # crea si ya existe q_ini) dejaba de reconocerse como parte de [q,A,p].
+    base = re.sub(r"('\d+)+$", '', sym)
     return base == 'S' or (base.startswith('[') and base.endswith(']'))
 
 
@@ -401,23 +420,31 @@ def convert_pda_to_cfg(pda: PDA) -> str:
     estados = set(pda.states) | {q_ini, q_vac}
     pila    = set(pda.stack_alphabet) | {fondo}
 
-    trans: Dict[Tuple[str, str, str], Set[Tuple[str, Tuple[str, ...]]]] = {}
+    # Diccionario de listas sin repetidos (no sets) y recorridos ordenados:
+    # la gramática resultante es SIEMPRE la misma para el mismo APD (con sets
+    # el orden — y la numeración de los no terminales factorizados — dependía
+    # del hash de cada ejecución). El respaldo local de la app
+    # (lib/services/pda_cfg.dart) reproduce este mismo algoritmo.
+    trans: Dict[Tuple[str, str, str], List[Tuple[str, Tuple[str, ...]]]] = {}
+    pila_ord = sorted(pila)
 
     def add_t(q, a, Z, r, gamma):
-        trans.setdefault((q, a, Z), set()).add((r, tuple(gamma)))
+        destinos = trans.setdefault((q, a, Z), [])
+        if (r, tuple(gamma)) not in destinos:
+            destinos.append((r, tuple(gamma)))
 
     add_t(q_ini, EPSILON, fondo, pda.start_state, (pda.start_symbol, fondo))
     for (q, a, Z), results in pda.transitions.items():
         for (r, gamma) in results:
             if Z == EPSILON:
-                for X in pila:
+                for X in pila_ord:
                     add_t(q, a, X, r, tuple(gamma) + (X,))
             else:
                 add_t(q, a, Z, r, gamma)
-    for qf in pda.accept_states:
-        for X in pila:
+    for qf in sorted(pda.accept_states):
+        for X in pila_ord:
             add_t(qf, EPSILON, X, q_vac, ())
-    for X in pila:
+    for X in pila_ord:
         add_t(q_vac, EPSILON, X, q_vac, ())
 
     # ── Step 1: build raw productions ─────────────────────────────────────────
